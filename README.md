@@ -42,3 +42,20 @@ bin/odoo-domain \
 The dedicated service account is read-only and restricted to these business
 models: partners, products, sales, invoices, stock, CRM leads, and purchases.
 Administrative and credential-bearing models are excluded.
+
+## BOM materials from sales-order input
+
+`bin/odoo-bom` reads sales-order references from CSV, TSV, JSON, or plain text
+(one reference per line), expands nested manufacturing BOMs over the direct
+HTTPS Odoo interface, and writes CSV. CSV headers may use `sales order`,
+`sales_order`, `sale order`, `sale_order`, `order`, or `name`.
+
+```bash
+bin/odoo-bom orders.csv --output materials.csv
+```
+
+The output columns are `sales order`, `product name`, `description`, `price`,
+`quantity`, `tax`, and `subtotal with tax`. Price is the component list price;
+tax is the effective rate calculated on the originating sales-order line, and
+the subtotal applies that rate to the expanded material value. The HTTP account
+receives read access only to the BOM models required for this report.

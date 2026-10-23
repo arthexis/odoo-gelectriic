@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Export BOM materials for sales orders supplied in CSV, TSV, JSON, or text.
+
+The active Bastion key supplies the HTTPS Odoo credential. Output is CSV with
+sales order, product name, description, price, quantity, tax, and subtotal
+with tax columns. Only Odoo read methods are used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import subprocess
+import sys
+import tomllib
+from collections import defaultdict
+from pathlib import Path
+from urllib.parse import urlsplit
+from xmlrpc.client import Fault, ProtocolError, ServerProxy
+
+
+BASTION_STATUS = Path("/usr/local/libexec/bastion-key-present")
+BASTION_MOUNT = Path("/mnt/bastion-unlock")
+SECRET_BUNDLE = BASTION_MOUNT / "bastion/odoo/active.http.toml.enc"
+PASSPHRASE = Path.home() / ".local/state/odoo/.bastion-passphrase"
+OUTPUT_COLUMNS = ("sales order", "product name", "description", "price", "quantity", "tax", "subtotal with tax")
+ORDER_HEADERS = ("sales order", "sales_order", "sale order", "sale_order", "order", "name")
+
+
+class BomError(RuntimeError):
+    pass
+
+
+def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+
+
+def require_bastion() -> None:
+    if run([str(BASTION_STATUS), "--status"]).stdout.strip() != b"present": raise BomError("Bastion key is not present.")
+    if not BASTION_MOUNT.is_mount(): raise BomError("Bastion mount is unavailable.")
+    if b"ro" not in run(["findmnt", "-no", "OPTIONS", "--target", str(BASTION_MOUNT)]).stdout.strip().split(b","): raise BomError("Bastion mount must be read-only.")
+    if not SECRET_BUNDLE.is_file() or not PASSPHRASE.is_file() or PASSPHRASE.stat().st_mode & 0o077: raise BomError("Active HTTP bundle or mode-0600 passphrase is unavailable.")
+
+
+def credentials() -> dict[str, str]:
+    result = run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-in", str(SECRET_BUNDLE), "-pass", f"file:{PASSPHRASE}"])
+    try: data = tomllib.loads(result.stdout.decode()) if result.returncode == 0 else {}
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError): data = {}
+    keys = ("url", "database", "username", "password")
+    if any(not isinstance(data.get(key), str) or not data[key] for key in keys): raise BomError("Active HTTP bundle is invalid.")
+    parsed = urlsplit(data["url"])
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password: raise BomError("Active HTTP bundle must name an HTTPS endpoint.")
+    return {key: data[key] for key in keys}
+
+
+def read_order_refs(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8-sig")
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        value = json.loads(text)
+        if isinstance(value, dict): value = value.get("sales_orders", value.get("orders", []))
+        if not isinstance(value, list): raise BomError("JSON input must be an array, or an object with orders/sales_orders.")
+        raw = [item if isinstance(item, str) else next((item.get(key) for key in ORDER_HEADERS if isinstance(item, dict) and item.get(key)), "") for item in value]
+    elif suffix in {".csv", ".tsv"}:
+        if suffix == ".tsv":
+            dialect = csv.excel_tab
+        else:
+            try:
+                dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+        rows = list(csv.reader(io.StringIO(text), dialect))
+        if not rows: return []
+        headers = [cell.strip().lower() for cell in rows[0]]
+        index = next((headers.index(header) for header in ORDER_HEADERS if header in headers), 0)
+        raw = [row[index] for row in rows[1:] if len(row) > index]
+    else:
+        raw = [line.strip() for line in text.splitlines()]
+    return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+
+
+def relation_id(value: object) -> int | None:
+    if isinstance(value, bool): return None
+    if isinstance(value, int): return value
+    if isinstance(value, (list, tuple)) and value and isinstance(value[0], int): return value[0]
+    return None
+
+
+class Odoo:
+    def __init__(self, config: dict[str, str]):
+        root = config["url"].rstrip("/")
+        common = ServerProxy(f"{root}/xmlrpc/2/common", allow_none=True, use_builtin_types=True)
+        self.uid = common.authenticate(config["database"], config["username"], config["password"], {})
+        if not isinstance(self.uid, int) or not self.uid: raise BomError("Odoo HTTP authentication failed.")
+        self.config, self.objects = config, ServerProxy(f"{root}/xmlrpc/2/object", allow_none=True, use_builtin_types=True)
+
+    def call(self, model: str, method: str, args: list[object], kwargs: dict[str, object] | None = None) -> object:
+        return self.objects.execute_kw(self.config["database"], self.uid, self.config["password"], model, method, args, kwargs or {})
+
+    def search_read(self, model: str, domain: list[object], fields: list[str]) -> list[dict[str, object]]:
+        result = self.call(model, "search_read", [domain], {"fields": fields, "limit": 1000})
+        if not isinstance(result, list): raise BomError(f"Unexpected Odoo response for {model}.")
+        return result
+
+
+class BomExporter:
+    def __init__(self, odoo: Odoo):
+        self.odoo, self.products, self.boms, self.bom_lines = odoo, {}, {}, {}
+
+    def product(self, product_id: int) -> dict[str, object]:
+        if product_id not in self.products:
+            rows = self.odoo.search_read("product.product", [["id", "=", product_id]], ["display_name", "description_sale", "list_price", "product_tmpl_id"])
+            if not rows: raise BomError(f"Product {product_id} no longer exists.")
+            self.products[product_id] = rows[0]
+        return self.products[product_id]
+
+    def bom(self, product_id: int) -> dict[str, object] | None:
+        if product_id in self.boms: return self.boms[product_id] or None
+        product = self.product(product_id); template_id = relation_id(product.get("product_tmpl_id"))
+        domain: list[object] = ["|", ["product_id", "=", product_id], ["product_tmpl_id", "=", template_id or 0]]
+        candidates = self.odoo.search_read("mrp.bom", domain, ["product_id", "product_tmpl_id", "product_qty", "sequence", "type"])
+        candidates = [bom for bom in candidates if bom.get("type") in (False, "normal")]
+        candidates.sort(key=lambda bom: (0 if relation_id(bom.get("product_id")) == product_id else 1, int(bom.get("sequence") or 0), int(bom["id"])))
+        self.boms[product_id] = candidates[0] if candidates else {}
+        return self.boms[product_id] or None
+
+    def lines(self, bom_id: int) -> list[dict[str, object]]:
+        if bom_id not in self.bom_lines:
+            self.bom_lines[bom_id] = self.odoo.search_read("mrp.bom.line", [["bom_id", "=", bom_id]], ["product_id", "product_qty"])
+        return self.bom_lines[bom_id]
+
+    def explode(self, product_id: int, quantity: float, stack: frozenset[int] = frozenset()) -> list[tuple[int, float]]:
+        if product_id in stack: raise BomError("Cyclic BOM detected.")
+        bom = self.bom(product_id)
+        if not bom: return [(product_id, quantity)]
+        base = float(bom.get("product_qty") or 1)
+        output: list[tuple[int, float]] = []
+        for line in self.lines(int(bom["id"])):
+            component = relation_id(line.get("product_id"))
+            if component: output.extend(self.explode(component, quantity * float(line.get("product_qty") or 0) / base, stack | {product_id}))
+        return output
+
+    def export(self, refs: list[str]) -> list[dict[str, object]]:
+        orders = self.odoo.search_read("sale.order", [["name", "in", refs]], ["name"])
+        by_id = {int(order["id"]): str(order["name"]) for order in orders}
+        missing = sorted(set(refs) - set(by_id.values()))
+        if missing: raise BomError("Sales orders not found: " + ", ".join(missing))
+        lines = self.odoo.search_read("sale.order.line", [["order_id", "in", list(by_id)]], ["order_id", "product_id", "name", "product_uom_qty", "price_subtotal", "price_tax", "display_type"])
+        rows: list[dict[str, object]] = []
+        for line in lines:
+            product_id, order_id = relation_id(line.get("product_id")), relation_id(line.get("order_id"))
+            if not product_id or not order_id or line.get("display_type"): continue
+            net = float(line.get("price_subtotal") or 0)
+            rate = float(line.get("price_tax") or 0) / net if net else 0
+            tax = f"{rate * 100:.2f}%"
+            for material_id, quantity in self.explode(product_id, float(line.get("product_uom_qty") or 0)):
+                material = self.product(material_id); price = float(material.get("list_price") or 0)
+                rows.append({"sales order": by_id[order_id], "product name": material.get("display_name", ""), "description": material.get("description_sale") or line.get("name", ""), "price": f"{price:.2f}", "quantity": f"{quantity:.4f}", "tax": tax, "subtotal with tax": f"{price * quantity * (1 + rate):.2f}"})
+        return rows
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path, help="CSV, TSV, JSON, or one-sales-order-per-line input file.")
+    parser.add_argument("--output", type=Path, help="Write CSV here instead of stdout.")
+    args = parser.parse_args()
+    try:
+        refs = read_order_refs(args.input)
+        if not refs: raise BomError("Input does not contain any sales-order references.")
+        require_bastion(); rows = BomExporter(Odoo(credentials())).export(refs)
+        stream = args.output.open("w", encoding="utf-8", newline="") if args.output else sys.stdout
+        with stream if args.output else _NoClose(stream) as handle:
+            writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS); writer.writeheader(); writer.writerows(rows)
+        return 0
+    except (OSError, Fault, ProtocolError, BomError, json.JSONDecodeError) as exc:
+        print(f"odoo-bom: {exc}", file=sys.stderr); return 2
+
+
+class _NoClose:
+    def __init__(self, stream: io.TextIOBase): self.stream = stream
+    def __enter__(self) -> io.TextIOBase: return self.stream
+    def __exit__(self, *_: object) -> None: pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
