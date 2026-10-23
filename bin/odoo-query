@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Run one read-only PostgreSQL query using the inserted Bastion key.
+
+The key supplies an encrypted ``active.postgres.toml.enc`` bundle.  The bundle
+selects the target SSH host and database; this executable has no instance name
+or endpoint embedded in it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+
+BASTION_STATUS = Path("/usr/local/libexec/bastion-key-present")
+BASTION_MOUNT = Path("/mnt/bastion-unlock")
+SECRET_BUNDLE = BASTION_MOUNT / "bastion/odoo/active.postgres.toml.enc"
+PASSPHRASE = Path.home() / ".local/state/odoo/.bastion-passphrase"
+AGENT_SOCKET = Path("/run/bastion-ssh/agent.sock")
+EXPECTED_PUBLIC_KEY = Path.home() / ".ssh/jump-outbound.pub"
+FORBIDDEN_SQL = re.compile(r"\b(alter|analyze|begin|call|comment|commit|copy|create|deallocate|delete|do|drop|execute|grant|insert|lock|merge|prepare|refresh|reindex|revoke|rollback|set|show|truncate|update|vacuum)\b", re.I)
+FORBIDDEN_FUNCTIONS = re.compile(r"\b(dblink|lo_export|lo_import|pg_cancel_backend|pg_logical_emit_message|pg_read_binary_file|pg_read_file|pg_reload_conf|pg_rotate_logfile|pg_terminate_backend|pg_write_file)\s*\(", re.I)
+
+
+class QueryError(RuntimeError):
+    pass
+
+
+def run(args: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+
+
+def require_bastion() -> None:
+    if run([str(BASTION_STATUS), "--status"]).stdout.strip() != b"present":
+        raise QueryError("Bastion key is not present.")
+    if not BASTION_MOUNT.is_mount():
+        raise QueryError("Bastion mount is unavailable.")
+    if b"ro" not in run(["findmnt", "-no", "OPTIONS", "--target", str(BASTION_MOUNT)]).stdout.strip().split(b","):
+        raise QueryError("Bastion mount must be read-only before querying.")
+    if not AGENT_SOCKET.is_socket() or not EXPECTED_PUBLIC_KEY.is_file():
+        raise QueryError("Bastion SSH agent or expected public identity is unavailable.")
+    agent_env = os.environ | {"SSH_AUTH_SOCK": str(AGENT_SOCKET)}
+    identities = run(["ssh-add", "-L"], env=agent_env)
+    if identities.returncode or EXPECTED_PUBLIC_KEY.read_bytes().strip() not in {line.strip() for line in identities.stdout.splitlines()}:
+        raise QueryError("Expected Bastion public identity is not loaded in the SSH agent.")
+    if not SECRET_BUNDLE.is_file() or not PASSPHRASE.is_file() or PASSPHRASE.stat().st_mode & 0o077:
+        raise QueryError("Active key bundle or mode-0600 local passphrase is unavailable.")
+
+
+def decrypt_config() -> dict[str, str]:
+    result = run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-in", str(SECRET_BUNDLE), "-pass", f"file:{PASSPHRASE}"])
+    try:
+        data = tomllib.loads(result.stdout.decode("utf-8")) if result.returncode == 0 else {}
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        data = {}
+    keys = ("ssh_target", "pgpass")
+    if any(not isinstance(data.get(key), str) or not data[key] for key in keys):
+        raise QueryError("Active PostgreSQL bundle is invalid.")
+    return {key: data[key] for key in keys}
+
+
+def split_pgpass(line: str) -> tuple[str, str, str, str, str]:
+    fields, field, escaped = [], [], False
+    for char in line:
+        if escaped:
+            field.append(char); escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == ":":
+            fields.append("".join(field)); field = []
+        else:
+            field.append(char)
+    fields.append("".join(field) + ("\\" if escaped else ""))
+    if len(fields) != 5 or not all(fields) or any(value == "*" for value in fields[:4]):
+        raise QueryError("Active bundle does not contain one concrete .pgpass record.")
+    return tuple(fields)  # type: ignore[return-value]
+
+
+def escape_pgpass(value: str) -> str:
+    return value.replace("\\", "\\\\").replace(":", "\\:")
+
+
+def validate_sql(sql: str) -> str:
+    statement = sql.strip().removesuffix(";").rstrip()
+    if not statement or ";" in statement or any(marker in statement for marker in ("--", "/*", "*/")):
+        raise QueryError("Submit exactly one comment-free statement.")
+    normalized = re.sub(r"\s+", " ", statement)
+    if not (re.match(r"^select\b", normalized, re.I) or re.match(r"^explain(?:\s+\([^)]*\))?\s+select\b", normalized, re.I)):
+        raise QueryError("Only SELECT or EXPLAIN SELECT statements are permitted.")
+    if re.search(r"\bselect\s+.*\binto\b", normalized, re.I) or FORBIDDEN_SQL.search(normalized) or FORBIDDEN_FUNCTIONS.search(normalized):
+        raise QueryError("The query contains a disallowed write or administrative operation.")
+    return normalized
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0)); return int(probe.getsockname()[1])
+
+
+def wait_for_tunnel(process: subprocess.Popen[bytes], port: int) -> None:
+    for _ in range(120):
+        if process.poll() is not None: raise QueryError("SSH tunnel exited before it became available.")
+        with socket.socket() as check:
+            check.settimeout(.1)
+            if check.connect_ex(("127.0.0.1", port)) == 0: return
+        time.sleep(.1)
+    raise QueryError("Timed out waiting for the SSH tunnel.")
+
+
+def query(sql: str, config: dict[str, str]) -> int:
+    host, port, database, username, password = split_pgpass(config["pgpass"])
+    local_port = free_port()
+    agent_env = os.environ | {"SSH_AUTH_SOCK": str(AGENT_SOCKET)}
+    tunnel = subprocess.Popen(["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", f"IdentityAgent={AGENT_SOCKET}", "-L", f"127.0.0.1:{local_port}:{host}:{port}", config["ssh_target"]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=agent_env)
+    credential_path: Path | None = None
+    try:
+        wait_for_tunnel(tunnel, local_port)
+        with tempfile.NamedTemporaryFile(mode="w", prefix="odoo-query-", dir="/dev/shm" if Path("/dev/shm").is_dir() else None, delete=False) as handle:
+            credential_path = Path(handle.name); os.chmod(credential_path, 0o600)
+            handle.write(":".join(escape_pgpass(value) for value in ("127.0.0.1", str(local_port), database, username, password)) + "\n")
+        env = os.environ | {"PGPASSFILE": str(credential_path), "PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGDATABASE": database, "PGUSER": username, "PGOPTIONS": "-c default_transaction_read_only=on"}
+        return subprocess.run(["psql", "-X", "-w", "-v", "ON_ERROR_STOP=1", "--pset", "pager=off", "-c", f"BEGIN READ ONLY; {sql}; COMMIT;"], env=env, check=False).returncode
+    finally:
+        if credential_path: credential_path.unlink(missing_ok=True)
+        if tunnel.poll() is None:
+            tunnel.terminate()
+            try: tunnel.wait(timeout=5)
+            except subprocess.TimeoutExpired: tunnel.kill(); tunnel.wait(timeout=5)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sql"); parser.add_argument("--file", type=Path); parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    if args.check == bool(args.sql or args.file): parser.error("use --check, or exactly one of --sql/--file")
+    if bool(args.sql) == bool(args.file) and not args.check: parser.error("provide exactly one of --sql or --file")
+    try:
+        require_bastion(); config = decrypt_config()
+        if args.check: split_pgpass(config["pgpass"]); print("Active Bastion PostgreSQL bundle is available."); return 0
+        return query(validate_sql(args.sql if args.sql is not None else args.file.read_text(encoding="utf-8")), config)
+    except (OSError, QueryError) as exc:
+        print(f"odoo-query: {exc}", file=sys.stderr); return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
