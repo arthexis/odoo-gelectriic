@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Run native Odoo ``search_read`` domain queries using the inserted key.
+
+The key supplies an encrypted ``active.http.toml.enc`` bundle.  This client
+uses HTTPS/XML-RPC directly and never creates an SSH tunnel.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+from urllib.parse import urlsplit
+from xmlrpc.client import Fault, ProtocolError, ServerProxy
+
+
+BASTION_STATUS = Path("/usr/local/libexec/bastion-key-present")
+BASTION_MOUNT = Path("/mnt/bastion-unlock")
+SECRET_BUNDLE = BASTION_MOUNT / "bastion/odoo/active.http.toml.enc"
+PASSPHRASE = Path.home() / ".local/state/odoo/.bastion-passphrase"
+READABLE_MODELS = frozenset({"account.move", "account.move.line", "crm.lead", "product.product", "product.template", "purchase.order", "purchase.order.line", "res.partner", "sale.order", "sale.order.line", "stock.move", "stock.picking"})
+
+
+class DomainQueryError(RuntimeError):
+    pass
+
+
+def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+
+
+def require_bastion() -> None:
+    if run([str(BASTION_STATUS), "--status"]).stdout.strip() != b"present": raise DomainQueryError("Bastion key is not present.")
+    if not BASTION_MOUNT.is_mount(): raise DomainQueryError("Bastion mount is unavailable.")
+    if b"ro" not in run(["findmnt", "-no", "OPTIONS", "--target", str(BASTION_MOUNT)]).stdout.strip().split(b","): raise DomainQueryError("Bastion mount must be read-only before querying.")
+    if not SECRET_BUNDLE.is_file() or not PASSPHRASE.is_file() or PASSPHRASE.stat().st_mode & 0o077: raise DomainQueryError("Active HTTP bundle or mode-0600 local passphrase is unavailable.")
+
+
+def credentials() -> dict[str, str]:
+    result = run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-in", str(SECRET_BUNDLE), "-pass", f"file:{PASSPHRASE}"])
+    try: data = tomllib.loads(result.stdout.decode("utf-8")) if result.returncode == 0 else {}
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError): data = {}
+    keys = ("url", "database", "username", "password")
+    if any(not isinstance(data.get(key), str) or not data[key] for key in keys): raise DomainQueryError("Active HTTP bundle is invalid.")
+    parsed = urlsplit(data["url"])
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment: raise DomainQueryError("Active HTTP bundle must name a bare HTTPS Odoo endpoint.")
+    return {key: data[key] for key in keys}
+
+
+def parse_domain(source: str) -> list[object]:
+    try: domain = json.loads(source)
+    except json.JSONDecodeError as exc: raise DomainQueryError("Domain must be a JSON array using native Odoo domain syntax.") from exc
+    if not isinstance(domain, list): raise DomainQueryError("Domain must be a JSON array using native Odoo domain syntax.")
+    return domain
+
+
+def parse_fields(source: str) -> list[str]:
+    fields = [field.strip() for field in source.split(",") if field.strip()]
+    if not fields or any(not field.replace("_", "").isalnum() for field in fields): raise DomainQueryError("Fields must be a comma-separated list of Odoo field names.")
+    return fields
+
+
+def client(config: dict[str, str]) -> tuple[ServerProxy, int]:
+    root = config["url"].rstrip("/"); common = ServerProxy(f"{root}/xmlrpc/2/common", allow_none=True, use_builtin_types=True)
+    uid = common.authenticate(config["database"], config["username"], config["password"], {})
+    if not isinstance(uid, int) or not uid: raise DomainQueryError("Odoo HTTP authentication failed.")
+    return ServerProxy(f"{root}/xmlrpc/2/object", allow_none=True, use_builtin_types=True), uid
+
+
+def check(config: dict[str, str]) -> None:
+    root = config["url"].rstrip("/"); version = ServerProxy(f"{root}/xmlrpc/2/common", allow_none=True).version()
+    if not isinstance(version, dict) or not version.get("server_version"): raise DomainQueryError("Odoo XML-RPC version probe failed.")
+    client(config)
+
+
+def search_read(config: dict[str, str], model: str, domain: list[object], fields: list[str], limit: int, offset: int, order: str | None) -> list[dict[str, object]]:
+    if model not in READABLE_MODELS: raise DomainQueryError("Model is not allowed for this read-only interface: " + ", ".join(sorted(READABLE_MODELS)))
+    objects, uid = client(config); options: dict[str, object] = {"fields": fields, "limit": limit, "offset": offset}
+    if order: options["order"] = order
+    result = objects.execute_kw(config["database"], uid, config["password"], model, "search_read", [domain], options)
+    if not isinstance(result, list): raise DomainQueryError("Odoo returned an unexpected query response.")
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model"); parser.add_argument("--domain", default="[]"); parser.add_argument("--fields", default="id"); parser.add_argument("--limit", type=int, default=20); parser.add_argument("--offset", type=int, default=0); parser.add_argument("--order"); parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    if args.check and args.model: parser.error("--check cannot be combined with --model")
+    if not args.check and not args.model: parser.error("--model is required unless using --check")
+    if not 1 <= args.limit <= 200 or args.offset < 0: parser.error("--limit must be 1-200 and --offset must be non-negative")
+    try:
+        require_bastion(); config = credentials()
+        if args.check: check(config); print("Active Bastion HTTP credential and XML-RPC authentication are available."); return 0
+        print(json.dumps(search_read(config, args.model, parse_domain(args.domain), parse_fields(args.fields), args.limit, args.offset, args.order), ensure_ascii=False, indent=2, default=str)); return 0
+    except (OSError, ProtocolError, Fault, DomainQueryError) as exc:
+        print(f"odoo-domain: {exc}", file=sys.stderr); return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
