@@ -55,7 +55,10 @@ bin/odoo-bom orders.csv --output materials.csv
 ```
 
 The output columns are `sales order`, `product name`, `description`, `price`,
-`quantity`, `tax`, and `subtotal with tax`. Price is the component list price;
-tax is the effective rate calculated on the originating sales-order line, and
-the subtotal applies that rate to the expanded material value. The HTTP account
-receives read access only to the BOM models required for this report.
+`quantity`, `tax`, `item subtotal tax`, and `subtotal with tax`. Price is the
+component list price; zero-price materials are omitted. `item subtotal tax` is
+the tax amount on `price × quantity`, using the effective rate calculated on
+the originating sales-order line. Files written with `--output` use UTF-8 with
+a BOM so Excel recognizes accents and other non-ASCII characters correctly.
+The HTTP account receives read access only to the BOM models required for this
+report.
