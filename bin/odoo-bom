@@ -2,8 +2,8 @@
 """Export BOM materials for sales orders supplied in CSV, TSV, JSON, or text.
 
 The active Bastion key supplies the HTTPS Odoo credential. Output is CSV with
-sales order, product name, description, price, quantity, tax, and subtotal
-with tax columns. Only Odoo read methods are used.
+sales order, product name, description, price, quantity, tax, item subtotal
+tax, and subtotal with tax columns. Only Odoo read methods are used.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ BASTION_STATUS = Path("/usr/local/libexec/bastion-key-present")
 BASTION_MOUNT = Path("/mnt/bastion-unlock")
 SECRET_BUNDLE = BASTION_MOUNT / "bastion/odoo/active.http.toml.enc"
 PASSPHRASE = Path.home() / ".local/state/odoo/.bastion-passphrase"
-OUTPUT_COLUMNS = ("sales order", "product name", "description", "price", "quantity", "tax", "subtotal with tax")
+OUTPUT_COLUMNS = ("sales order", "product name", "description", "price", "quantity", "tax", "item subtotal tax", "subtotal with tax")
 ORDER_HEADERS = ("sales order", "sales_order", "sale order", "sale_order", "order", "name")
 
 
@@ -86,6 +86,24 @@ def relation_id(value: object) -> int | None:
     if isinstance(value, int): return value
     if isinstance(value, (list, tuple)) and value and isinstance(value[0], int): return value[0]
     return None
+
+
+def material_row(sales_order: str, material: dict[str, object], description: object, quantity: float, rate: float) -> dict[str, object] | None:
+    price = float(material.get("list_price") or 0)
+    if price == 0:
+        return None
+    subtotal = price * quantity
+    item_tax = subtotal * rate
+    return {
+        "sales order": sales_order,
+        "product name": material.get("display_name", ""),
+        "description": material.get("description_sale") or description,
+        "price": f"{price:.2f}",
+        "quantity": f"{quantity:.4f}",
+        "tax": f"{rate * 100:.2f}%",
+        "item subtotal tax": f"{item_tax:.2f}",
+        "subtotal with tax": f"{subtotal + item_tax:.2f}",
+    }
 
 
 class Odoo:
@@ -154,10 +172,10 @@ class BomExporter:
             if not product_id or not order_id or line.get("display_type"): continue
             net = float(line.get("price_subtotal") or 0)
             rate = float(line.get("price_tax") or 0) / net if net else 0
-            tax = f"{rate * 100:.2f}%"
             for material_id, quantity in self.explode(product_id, float(line.get("product_uom_qty") or 0)):
-                material = self.product(material_id); price = float(material.get("list_price") or 0)
-                rows.append({"sales order": by_id[order_id], "product name": material.get("display_name", ""), "description": material.get("description_sale") or line.get("name", ""), "price": f"{price:.2f}", "quantity": f"{quantity:.4f}", "tax": tax, "subtotal with tax": f"{price * quantity * (1 + rate):.2f}"})
+                row = material_row(by_id[order_id], self.product(material_id), line.get("name", ""), quantity, rate)
+                if row:
+                    rows.append(row)
         return rows
 
 
@@ -170,7 +188,7 @@ def main() -> int:
         refs = read_order_refs(args.input)
         if not refs: raise BomError("Input does not contain any sales-order references.")
         require_bastion(); rows = BomExporter(Odoo(credentials())).export(refs)
-        stream = args.output.open("w", encoding="utf-8", newline="") if args.output else sys.stdout
+        stream = args.output.open("w", encoding="utf-8-sig", newline="") if args.output else sys.stdout
         with stream if args.output else _NoClose(stream) as handle:
             writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS); writer.writeheader(); writer.writerows(rows)
         return 0

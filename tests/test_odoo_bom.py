@@ -30,4 +30,22 @@ def test_relation_id_handles_odoo_relations():
 
 
 def test_output_columns_match_report_contract():
-    assert MODULE.OUTPUT_COLUMNS == ("sales order", "product name", "description", "price", "quantity", "tax", "subtotal with tax")
+    assert MODULE.OUTPUT_COLUMNS == ("sales order", "product name", "description", "price", "quantity", "tax", "item subtotal tax", "subtotal with tax")
+
+
+def test_material_row_calculates_tax_and_omits_zero_price_items():
+    material = {"display_name": "Café", "description_sale": "Pièce", "list_price": 10}
+    row = MODULE.material_row("S1", material, "fallback", 2, 0.16)
+    assert row["item subtotal tax"] == "3.20"
+    assert row["subtotal with tax"] == "23.20"
+    assert MODULE.material_row("S1", {"list_price": 0}, "fallback", 2, 0.16) is None
+
+
+def test_output_file_uses_utf8_bom_for_excel(tmp_path):
+    path = tmp_path / "materials.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = MODULE.csv.DictWriter(handle, fieldnames=MODULE.OUTPUT_COLUMNS)
+        writer.writeheader()
+        writer.writerow(MODULE.material_row("S1", {"display_name": "Café", "list_price": 1}, "Pièce", 1, 0) or {})
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert "Café" in path.read_text(encoding="utf-8-sig")
